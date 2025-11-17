@@ -1,0 +1,6 @@
+configuration-as-code:latest
+workflow-aggregator:latest
+git:latest
+credentials:latest
+matrix-auth:latest
+sonar:latest

@@ -1,18 +1,23 @@
----
-- name: Instalar y configurar Nginx
+﻿---
+# Playbook para configuración completa del stack DevOps
+# Autoras: Daniela Londoño - Isabella Huila
+
+- name: Configurar servidor Nginx
   hosts: nginx
   become: true
+  
   tasks:
     - name: Actualizar cache de paquetes
       apt:
         update_cache: yes
+        cache_valid_time: 3600
 
     - name: Instalar Nginx
       apt:
         name: nginx
         state: present
 
-    - name: Iniciar servicio Nginx
+    - name: Iniciar y habilitar servicio Nginx
       systemd:
         name: nginx
         state: started
@@ -25,92 +30,376 @@
         group: "{{ ansible_user }}"
         recurse: yes
 
-- name: Instalación de Docker y Docker Compose en Ubuntu
+- name: Configurar stack Jenkins + SonarQube + Docker
   hosts: jenkins
   become: true
   
+  vars:
+    jenkins_admin_password: "admin123"
+    sonar_admin_password: "Admin123!"
+    jenkins_host: "{{ ansible_default_ipv4.address }}"
+
   tasks:
-    # Actualizar el cache de paquetes
-    - name: Actualizar el cache de paquetes
+    # ============================================
+    # FASE 1: Preparación del Sistema Operativo
+    # ============================================
+    
+    - name: Actualizar cache de paquetes
       apt:
         update_cache: yes
+        cache_valid_time: 3600
 
-    # Instalar dependencias para Docker
-    - name: Instalar dependencias para Docker
+    - name: Instalar dependencias del sistema
       apt:
-        name: 
+        name:
           - apt-transport-https
           - ca-certificates
           - curl
-          - gnupg-agent
-          - software-properties-common
-
-    # Agregar la clave GPG oficial de Docker
-    - name: Agregar la clave GPG oficial de Docker
-      apt_key:
-        url: https://download.docker.com/linux/ubuntu/gpg
+          - gnupg
+          - lsb-release
+          - python3-pip
         state: present
 
-    # Agregar el repositorio de Docker al sources.list.d
-    - name: Agregar el repositorio de Docker al sources.list.d
+    - name: Crear directorio para GPG keys de Docker
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Agregar clave GPG oficial de Docker
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Agregar repositorio de Docker
       apt_repository:
-        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
         state: present
+        filename: docker
 
-    # Actualizar el cache de paquetes de nuevo (para que encuentre el paquete de Docker)
-    - name: Actualizar el cache de paquetes de nuevo (para que encuentre el paquete de Docker)
+    - name: Actualizar cache después de agregar repo Docker
       apt:
         update_cache: yes
 
-    # Instalar Docker
-    - name: Instalar Docker
+    - name: Instalar Docker CE
       apt:
-        name: docker-ce
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
         state: present
 
-    # Añadir el usuario actual al grupo de Docker
-    - name: Añadir el usuario actual al grupo de Docker
+    - name: Añadir usuario al grupo docker
       user:
         name: "{{ ansible_user }}"
         groups: docker
         append: yes
 
-    # Instalar Docker Compose
-    - name: Instalar Docker Compose
-      shell: |
-        curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        chmod +x /usr/local/bin/docker-compose
-      args:
-        creates: /usr/local/bin/docker-compose
-    
-    - name: Establecer vm.max_map_count en el kernel
+    - name: Instalar Docker Compose v2 plugin
+      apt:
+        name: docker-compose-plugin
+        state: present
+
+    - name: Actualizar pip a última versión
+      pip:
+        name: pip
+        state: latest
+
+    - name: Instalar módulos Python con versiones compatibles
+      pip:
+        name:
+          - docker==7.1.0
+          - requests==2.32.3
+          - urllib3==2.2.2
+        state: present
+
+    - name: Establecer vm.max_map_count para SonarQube
       sysctl:
         name: vm.max_map_count
         value: "262144"
         state: present
         reload: yes
-    
-    - name: Copiar archivo de configuración de Nginx
+
+    - name: Verificar si existe swap
+      command: swapon --show --noheadings
+      register: swap_show
+      changed_when: false
+      failed_when: false
+
+    - name: Crear swap de 2GB si no existe
+      block:
+        - name: Crear archivo swap
+          command: fallocate -l 2G /swapfile
+          args:
+            creates: /swapfile
+        
+        - name: Establecer permisos del swapfile
+          file:
+            path: /swapfile
+            mode: '0600'
+        
+        - name: Formatear swapfile
+          command: mkswap /swapfile
+          when: swap_show.stdout | trim == ''
+        
+        - name: Activar swap
+          command: swapon /swapfile
+          when: swap_show.stdout | trim == ''
+        
+        - name: Hacer swap persistente en /etc/fstab
+          lineinfile:
+            path: /etc/fstab
+            line: '/swapfile none swap sw 0 0'
+            state: present
+      when: swap_show.stdout | trim == ''
+
+    # ============================================
+    # FASE 2: Preparación de Archivos
+    # ============================================
+
+    - name: Crear directorio jenkins
+      file:
+        path: /home/{{ ansible_user }}/jenkins
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copiar Dockerfile de Jenkins
+      copy:
+        src: jenkins/Dockerfile
+        dest: /home/{{ ansible_user }}/jenkins/Dockerfile
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Copiar plugins.txt
+      copy:
+        src: jenkins/plugins.txt
+        dest: /home/{{ ansible_user }}/jenkins/plugins.txt
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Copiar casc.yaml
+      copy:
+        src: jenkins/casc.yaml
+        dest: /home/{{ ansible_user }}/jenkins/casc.yaml
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Crear archivo .env con placeholders
+      copy:
+        content: |
+          JENKINS_ADMIN_PASSWORD={{ jenkins_admin_password }}
+          SONARQUBE_URL=http://sonarqube:9000
+          SONAR_TOKEN=placeholder
+          JENKINS_URL=http://{{ jenkins_host }}
+          CASC_JENKINS_CONFIG=/usr/share/jenkins/ref/casc.yaml
+        dest: /home/{{ ansible_user }}/.env
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Copiar docker-compose.yml
       copy:
         src: docker-compose.yml
         dest: /home/{{ ansible_user }}/docker-compose.yml
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
 
-    # Ejecutar un archivo docker-compose.yml
-    - name: Ejecutar docker-compose.yml
-      command: docker-compose up -d
+    # ============================================
+    # FASE 3: Build de Imagen Jenkins
+    # ============================================
+
+    - name: Build imagen Jenkins personalizada
+      community.docker.docker_compose_v2:
+        project_src: /home/{{ ansible_user }}
+        build: always
+        state: present
+        services:
+          - jenkins
+      become_user: "{{ ansible_user }}"
+
+    # ============================================
+    # FASE 4: Arranque de Base de Datos y SonarQube
+    # ============================================
+
+    - name: Iniciar servicios db y sonarqube
+      community.docker.docker_compose_v2:
+        project_src: /home/{{ ansible_user }}
+        state: present
+        services:
+          - db
+          - sonarqube
+      become_user: "{{ ansible_user }}"
+
+    - name: Esperar a que SonarQube esté UP
+      uri:
+        url: "http://{{ jenkins_host }}:9000/api/system/status"
+        method: GET
+        return_content: yes
+      register: sonar_status
+      until: sonar_status.status == 200 and (sonar_status.json.status == "UP" or sonar_status.json.status == "STARTING")
+      retries: 40
+      delay: 15
+      failed_when: false
+
+    # ============================================
+    # FASE 5: Configuración SonarQube
+    # ============================================
+
+    - name: Cambiar contraseña admin de SonarQube
+      uri:
+        url: "http://{{ jenkins_host }}:9000/api/users/change_password"
+        method: POST
+        user: admin
+        password: admin
+        force_basic_auth: yes
+        body:
+          login: admin
+          password: "{{ sonar_admin_password }}"
+          previousPassword: admin
+        body_format: form-urlencoded
+        status_code: [204, 400]
+      register: password_change
+      failed_when: false
+
+    - name: Generar token de SonarQube para Jenkins
+      uri:
+        url: "http://{{ jenkins_host }}:9000/api/user_tokens/generate"
+        method: POST
+        user: admin
+        password: "{{ sonar_admin_password }}"
+        force_basic_auth: yes
+        body:
+          name: jenkins-ci
+        body_format: form-urlencoded
+        status_code: [200, 400]
+      register: token_result
+      failed_when: false
+
+    - name: Revocar token existente si es necesario
+      block:
+        - name: Revocar token jenkins-ci
+          uri:
+            url: "http://{{ jenkins_host }}:9000/api/user_tokens/revoke"
+            method: POST
+            user: admin
+            password: "{{ sonar_admin_password }}"
+            force_basic_auth: yes
+            body:
+              name: jenkins-ci
+            body_format: form-urlencoded
+            status_code: [204]
+
+        - name: Regenerar token
+          uri:
+            url: "http://{{ jenkins_host }}:9000/api/user_tokens/generate"
+            method: POST
+            user: admin
+            password: "{{ sonar_admin_password }}"
+            force_basic_auth: yes
+            body:
+              name: jenkins-ci
+            body_format: form-urlencoded
+          register: token_result
+      when: token_result.status == 400
+
+    - name: Extraer token de SonarQube
+      set_fact:
+        sonar_token: "{{ token_result.json.token }}"
+      when: token_result.json is defined and token_result.json.token is defined
+
+    - name: Validar que se obtuvo el token
+      fail:
+        msg: "No se pudo generar el token de SonarQube"
+      when: sonar_token is not defined or sonar_token == ''
+
+    - name: Actualizar archivo .env con token real
+      lineinfile:
+        path: /home/{{ ansible_user }}/.env
+        regexp: '^SONAR_TOKEN='
+        line: "SONAR_TOKEN={{ sonar_token }}"
+
+    # ============================================
+    # FASE 6: Preparación de Volumen Jenkins
+    # ============================================
+
+    - name: Detener contenedores para limpiar volumen
+      community.docker.docker_compose_v2:
+        project_src: /home/{{ ansible_user }}
+        state: stopped
+      become_user: "{{ ansible_user }}"
+      failed_when: false
+
+    - name: Limpiar plugins persistidos en volumen Jenkins
+      shell: |
+        if docker volume inspect jenkins-data >/dev/null 2>&1; then
+          VOLUME_PATH=$(docker volume inspect jenkins-data --format '{{.Mountpoint}}')
+          rm -rf "$VOLUME_PATH/plugins" "$VOLUME_PATH/war" "$VOLUME_PATH/caches" "$VOLUME_PATH/updates" || true
+        fi
       args:
-        chdir: /home/{{ ansible_user }}/
-      become_user: "{{ ansible_user }}"
-      become_method: su
+        executable: /bin/bash
 
-    - name: Instalar plugins jenkins
-      command: docker exec -it jenkins jenkins-plugin-cli --plugin-file /plugins.txt
-      become_user: "{{ ansible_user }}"
-      become_method: su
-      notify: restart jenkins
+    - name: Asegurar ownership del volumen jenkins-data
+      shell: |
+        if docker volume inspect jenkins-data >/dev/null 2>&1; then
+          VOLUME_PATH=$(docker volume inspect jenkins-data --format '{{.Mountpoint}}')
+          chown -R 1000:1000 "$VOLUME_PATH"
+        fi
+      args:
+        executable: /bin/bash
 
-  handlers:
-    - name: restart jenkins
-      command: sudo docker restart jenkins
+    # ============================================
+    # FASE 7: Arranque Final de Jenkins
+    # ============================================
+
+    - name: Iniciar todos los servicios con configuración completa
+      community.docker.docker_compose_v2:
+        project_src: /home/{{ ansible_user }}
+        state: present
+        recreate: always
+        env_files:
+          - /home/{{ ansible_user }}/.env
       become_user: "{{ ansible_user }}"
-      become_method: su
+
+    - name: Esperar a que Jenkins esté respondiendo
+      uri:
+        url: "http://{{ jenkins_host }}:80/login"
+        method: GET
+        status_code: [200, 302, 403, 503]
+      register: jenkins_status
+      until: jenkins_status.status in [200, 302, 403, 503]
+      retries: 60
+      delay: 5
+
+    # ============================================
+    # FASE 8: Validación Final
+    # ============================================
+
+    - name: Verificar contenedores en ejecución
+      command: docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+      register: docker_ps
+      become_user: "{{ ansible_user }}"
+
+    - name: Mostrar estado de contenedores
+      debug:
+        msg: "{{ docker_ps.stdout_lines }}"
+
+    - name: Mostrar resumen de despliegue
+      debug:
+        msg:
+          - "================================================"
+          - " DESPLIEGUE COMPLETADO EXITOSAMENTE"
+          - "================================================"
+          - " Jenkins: http://{{ jenkins_host }}"
+          - " Usuario: admin"
+          - " Contraseña: {{ jenkins_admin_password }}"
+          - ""
+          - " SonarQube: http://{{ jenkins_host }}:9000"
+          - " Usuario: admin"
+          - " Contraseña: {{ sonar_admin_password }}"
+          - " Token: {{ sonar_token }}"
+          - ""
+          - " Espera 2-3 minutos para que Jenkins termine de inicializar"
+          - "================================================"
